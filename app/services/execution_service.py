@@ -186,8 +186,16 @@ class ExecutionService:
         """
         start_time = time.time()
         process = None
+        parent_pgid = None
         
         try:
+            # Store parent process group ID to ensure we never kill it
+            if os.name != 'nt':
+                try:
+                    parent_pgid = os.getpgid(os.getpid())
+                except (OSError, AttributeError):
+                    parent_pgid = None
+            
             # Prepare minimal environment (filter out sensitive variables)
             env = {
                 "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
@@ -205,8 +213,19 @@ class ExecutionService:
                 if var in os.environ:
                     env[var] = os.environ[var]
             
-            # Set resource limits function (Unix only)
-            def set_limits():
+            # Set resource limits and create new process group (Unix only)
+            def set_limits_and_session():
+                try:
+                    # Create new process group/session BEFORE setting limits
+                    # This ensures the subprocess is in its own process group from the start
+                    os.setsid()  # Creates new session and process group
+                except (OSError, AttributeError):
+                    # If setsid fails, try setpgid as fallback
+                    try:
+                        os.setpgid(0, 0)  # Set current process as its own process group
+                    except (OSError, AttributeError):
+                        pass  # If both fail, continue anyway
+                
                 try:
                     max_memory_bytes = self.config.max_memory_mb * 1024 * 1024
                     resource.setrlimit(resource.RLIMIT_AS, (max_memory_bytes, max_memory_bytes))
@@ -224,7 +243,7 @@ class ExecutionService:
             
             # Create subprocess with isolation
             if os.name != 'nt':
-                # Unix: Use preexec_fn to set resource limits before exec
+                # Unix: Use preexec_fn to set resource limits and create new session
                 process = subprocess.Popen(
                     [self.config.python_executable, "-c", code],
                     stdout=subprocess.PIPE,
@@ -232,14 +251,9 @@ class ExecutionService:
                     text=True,
                     env=env,
                     cwd=work_dir,
-                    preexec_fn=set_limits,
+                    preexec_fn=set_limits_and_session,
                     close_fds=True
                 )
-                # Create new process group after process starts
-                try:
-                    os.setpgid(process.pid, process.pid)
-                except (OSError, ProcessLookupError):
-                    pass
             else:
                 # Windows: Use start_new_session for isolation
                 process = subprocess.Popen(
@@ -275,24 +289,45 @@ class ExecutionService:
                 
             except subprocess.TimeoutExpired:
                 logger.warning(f"[{execution_id}] Process timeout, terminating...")
-                # Terminate process
+                # Terminate process safely - only kill the subprocess, never the parent
                 if process:
                     try:
                         if os.name != 'nt':
+                            # On Unix, safely terminate the process group
                             try:
-                                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-                            except (ProcessLookupError, OSError):
+                                child_pgid = os.getpgid(process.pid)
+                                # CRITICAL: Only kill if it's not the parent's process group
+                                if parent_pgid is not None and child_pgid != parent_pgid:
+                                    os.killpg(child_pgid, signal.SIGTERM)
+                                else:
+                                    # If process groups match or we can't verify, use process.terminate()
+                                    logger.warning(f"[{execution_id}] Process group matches parent, using process.terminate()")
+                                    process.terminate()
+                            except (ProcessLookupError, OSError) as e:
+                                # Process might already be dead, try terminate anyway
+                                logger.debug(f"[{execution_id}] Could not get process group: {e}, using process.terminate()")
                                 process.terminate()
                         else:
+                            # Windows: just terminate the process
                             process.terminate()
                         
+                        # Wait for graceful termination
                         try:
                             process.wait(timeout=1)
                         except subprocess.TimeoutExpired:
+                            # Force kill if still running
                             if os.name != 'nt':
                                 try:
-                                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                                    child_pgid = os.getpgid(process.pid)
+                                    # CRITICAL: Only kill if it's not the parent's process group
+                                    if parent_pgid is not None and child_pgid != parent_pgid:
+                                        os.killpg(child_pgid, signal.SIGKILL)
+                                    else:
+                                        # If process groups match, use process.kill()
+                                        logger.warning(f"[{execution_id}] Process group matches parent, using process.kill()")
+                                        process.kill()
                                 except (ProcessLookupError, OSError):
+                                    # Process might already be dead, try kill anyway
                                     process.kill()
                             else:
                                 process.kill()
@@ -310,13 +345,21 @@ class ExecutionService:
                 
         except Exception as e:
             logger.error(f"[{execution_id}] Process execution error: {e}", exc_info=True)
-            # Terminate process if it exists
+            # Terminate process if it exists - safely, only kill the subprocess
             if process:
                 try:
                     if os.name != 'nt':
                         try:
-                            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                            child_pgid = os.getpgid(process.pid)
+                            # CRITICAL: Only kill if it's not the parent's process group
+                            if parent_pgid is not None and child_pgid != parent_pgid:
+                                os.killpg(child_pgid, signal.SIGTERM)
+                            else:
+                                # If process groups match or we can't verify, use process.terminate()
+                                logger.warning(f"[{execution_id}] Process group matches parent, using process.terminate()")
+                                process.terminate()
                         except (ProcessLookupError, OSError):
+                            # Process might already be dead, try terminate anyway
                             process.terminate()
                     else:
                         process.terminate()
@@ -325,7 +368,16 @@ class ExecutionService:
                     if process:
                         try:
                             if os.name != 'nt':
-                                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                                try:
+                                    child_pgid = os.getpgid(process.pid)
+                                    # CRITICAL: Only kill if it's not the parent's process group
+                                    if parent_pgid is not None and child_pgid != parent_pgid:
+                                        os.killpg(child_pgid, signal.SIGKILL)
+                                    else:
+                                        # If process groups match, use process.kill()
+                                        process.kill()
+                                except (ProcessLookupError, OSError):
+                                    process.kill()
                             else:
                                 process.kill()
                         except Exception:
